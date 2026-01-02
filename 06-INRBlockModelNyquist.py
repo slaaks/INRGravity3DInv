@@ -1,3 +1,5 @@
+#Nyquist limit implementation to positional encoding
+
 import os
 import time
 import random
@@ -6,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import math
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -59,22 +62,59 @@ def generate_grf_torch(nx, ny, nz, dx, dy, dz, lam, nu, sigma, device):
     m = (m - m.mean()) / (m.std() + 1e-9)
     return sigma * m
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, num_freqs=8, include_input=True):
-        super().__init__()
+class PositionalEncodingNyquist(nn.Module):
+    def __init__(
+        self,
+        num_freqs=8,
+        include_input=True,
+        obs_dx=None, obs_dy=None, dz_model=None, coords_std_meters=None,
+        safety=0.9
+    ):
+        super().__init__() 
         self.include_input = include_input
-        self.register_buffer('freqs', 2.0 ** torch.arange(0, num_freqs))
 
+        base = 2.0 ** torch.arange(0, num_freqs, dtype=torch.float32)
+        top = base[-1].item() #Frequency maximum
+
+        #Nyquist wavenumbers (rad/m)
+        kx = math.pi / float(obs_dx)
+        ky = math.pi / float(obs_dy)
+        kz = math.pi / float(dz_model)
+
+        #Axis std used in normalization
+        sx, sy, sz = [float(s) for s in coords_std_meters]
+
+        cap_x = safety * kx * sx
+        cap_y = safety * ky * sy
+        cap_z = safety * kz * sz
+
+        print(f"Nyquist limit: x={cap_x}, y={cap_y}, z={cap_z}")
+        print(f"Unconstrained features max: {top}")
+        
+        self.register_buffer('freqs', base)
+
+        scale_x = min(1.0, cap_x / top)
+        scale_y = min(1.0, cap_y / top)
+        scale_z = min(1.0, cap_z / top)
+        self.register_buffer('axis_scale', torch.tensor([scale_x, scale_y, scale_z], dtype=torch.float32))
+ 
     def forward(self, x):
         parts = [x] if self.include_input else []
+        x_scaled = x * self.axis_scale #elementwise scaling per axes
         for f in self.freqs:
-            parts += [torch.sin(f * x), torch.cos(f * x)]
+            parts += [torch.sin(f * x_scaled), torch.cos(f * x_scaled)]
         return torch.cat(parts, dim=-1)
 
 class DensityContrastINR(nn.Module):
-    def __init__(self, nfreq=8, hidden=256, depth=5, rho_abs_max=600.0):
+    def __init__(self, obs_dx, obs_dy, dz_model, coords_std_meters, nfreq=8, hidden=256, depth=5, rho_abs_max=600.0):
         super().__init__()
-        self.pe = PositionalEncoding(num_freqs=nfreq, include_input=True)
+        
+        self.pe = PositionalEncodingNyquist(
+            obs_dx=obs_dx, obs_dy=obs_dy, dz_model=dz_model,
+            coords_std_meters=coords_std_meters,
+            num_freqs=nfreq, include_input=True
+        )
+
         in_dim = 3 * (1 + 2 * nfreq)
         layers = []
         h = hidden
@@ -153,6 +193,7 @@ def run():
     c_std = grid_coords.std(axis=0, keepdims=True)
     coords_norm = (grid_coords - c_mean) / (c_std + 1e-12)
     coords_norm = torch.tensor(coords_norm, dtype=torch.float32, device=device, requires_grad=True)
+    coords_std_meters = c_std.squeeze()
 
     dz_half = dz / 2.0
     cell_grid = np.hstack([grid_coords, np.full((grid_coords.shape[0], 1), dz_half)])
@@ -182,7 +223,9 @@ def run():
 
     cfg = dict(gamma=1.0, epochs=300, lr=1e-2)
 
-    model = DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0).to(device)
+    #Change number of frequencies here
+    model = DensityContrastINR(obs_dx=dx, obs_dy=dy, dz_model=dz,coords_std_meters=coords_std_meters, nfreq=2, hidden=256, depth=4, rho_abs_max=600.0)
+
     opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'])
     hist = train_inr(model, opt, coords_norm, G, gz_obs, Wd, Nx, Ny, Nz, dx, dy, dz, cfg)
 
@@ -207,6 +250,7 @@ def run():
     inv_max = inv.max()
 
     fig1, axes = plt.subplots(3, 3, figsize=(16, 15))
+
     # 1D arrays of cell centers
     x1d, y1d, z1d = get_axes_coords()
 
@@ -220,7 +264,6 @@ def run():
     # for depth plots keep depth increasing downward by reversing z limits
     extent_xz = [x_edge_min, x_edge_max, z_edge_max, z_edge_min]
     extent_yz = [y_edge_min, y_edge_max, z_edge_max, z_edge_min]
-
 
     im = axes[0, 0].imshow(tru[:, :, iz].T, origin='lower', extent=extent_xy, aspect='auto', vmin=0, vmax=tru_max, cmap='viridis')
     axes[0, 0].set_title(f"True Δρ XY @ z≈{z1d[iz]:.0f} m")

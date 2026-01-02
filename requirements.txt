@@ -1,0 +1,34 @@
+contourpy @ file:///home/task_176364358039429/conda-bld/contourpy_1763643922278/work
+cycler @ file:///tmp/build/80754af9/cycler_1637851556182/work
+filelock @ file:///home/task_176241980242961/conda-bld/filelock_1762419845659/work
+fonttools @ file:///home/task_176544511060885/conda-bld/fonttools_1765445132369/work
+fsspec @ file:///home/task_176243241605877/conda-bld/fsspec_1762432434823/work
+gmpy2 @ file:///home/task_176474799565698/conda-bld/gmpy2_1764748043526/work
+importlib_metadata @ file:///home/task_176399614180195/conda-bld/importlib_metadata-suite_1763996574856/work
+Jinja2 @ file:///croot/jinja2_1741710844255/work
+kiwisolver @ file:///home/task_176415904289632/conda-bld/kiwisolver_1764159297891/work
+MarkupSafe @ file:///croot/markupsafe_1738584038848/work
+matplotlib==3.10.7
+mkl-service==2.5.2
+mkl_fft @ file:///home/task_176159249290440/conda-bld/mkl_fft_1761592897595/work
+mkl_random @ file:///home/task_176159294306005/conda-bld/mkl_random_1761592958759/work
+mpmath @ file:///work/perseverance-python-buildout/croot/mpmath_1728396928682/work
+networkx @ file:///home/task_176537856615560/conda-bld/networkx_1765378627201/work
+numpy @ file:///home/task_176397996305634/conda-bld/numpy_and_numpy_base_1763980680623/work/dist/numpy-2.3.5-cp313-cp313-linux_x86_64.whl#sha256=78c581a960868ba31a535f8c54fa0be861dd2d9db1419e7218ace9db5377e772
+opentelemetry-api @ file:///home/task_176399582131765/conda-bld/opentelemetry-api_1763996079309/work
+packaging @ file:///home/task_176104878999627/conda-bld/packaging_1761049078606/work
+pillow @ file:///home/task_176252756300243/conda-bld/pillow_1762528238732/work
+pyparsing @ file:///home/task_176397383618695/conda-bld/pyparsing_1763973847947/work
+PyQt6==6.9.1
+PyQt6_sip @ file:///home/task_175751009430255/conda-bld/pyqt-split_1757511023908/work/pyqt_sip
+python-dateutil @ file:///work/perseverance-python-buildout/croot/python-dateutil_1728385355105/work
+scipy @ file:///home/task_176219474400170/conda-bld/scipy_1762194758450/work/dist/scipy-1.16.3-cp313-cp313-linux_x86_64.whl#sha256=101be46a8559a597ca9bbc2555381426e7e7d6f600d75e7129f0439d3f6d19b8
+setuptools==80.9.0
+sip @ file:///croot/sip_1756223371714/work
+six @ file:///croot/six_1744271502820/work
+sympy @ file:///home/task_176476213567317/conda-bld/sympy_1764762917555/work
+torch @ file:///home/task_176527577139792/conda-bld/libtorch_1765275822345/work
+tornado @ file:///croot/tornado_1748956929273/work
+typing_extensions @ file:///croot/typing_extensions_1756280817316/work
+wheel==0.45.1
+zipp @ file:///home/task_176397781069023/conda-bld/zipp_1763977862013/work

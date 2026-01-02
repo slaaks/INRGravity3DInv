@@ -1,3 +1,5 @@
+#SIREN activation as an alternative to positional encoding
+
 import os
 import time
 import random
@@ -6,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import math
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -59,45 +62,80 @@ def generate_grf_torch(nx, ny, nz, dx, dy, dz, lam, nu, sigma, device):
     m = (m - m.mean()) / (m.std() + 1e-9)
     return sigma * m
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, num_freqs=8, include_input=True):
+class SirenLayer(nn.Module):
+    def __init__(self, in_features, out_features,
+                 omega_0=1.0, is_first=False, alpha=1.0, bound=3.0):
         super().__init__()
-        self.include_input = include_input
-        self.register_buffer('freqs', 2.0 ** torch.arange(0, num_freqs))
+        self.in_features = in_features
+        self.is_first = is_first
+        self.omega_0 = omega_0 #sine frequency
+        self.alpha = alpha #sine amplitude
+        self.bound = bound #linear limit before sine is applied
+        self.linear = nn.Linear(in_features, out_features) #linear transform
+        self.init_weights()
+
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first: #First small sine layer
+                bound_w = 1.0 / self.in_features
+            else:
+                bound_w = math.sqrt(6.0 / self.in_features) / max(self.omega_0, 1e-6) #Hidden layers, avoid exploding
+            self.linear.weight.uniform_(-bound_w, bound_w) #keep values in bounds
+            self.linear.bias.uniform_(-bound_w, bound_w)
 
     def forward(self, x):
-        parts = [x] if self.include_input else []
-        for f in self.freqs:
-            parts += [torch.sin(f * x), torch.cos(f * x)]
-        return torch.cat(parts, dim=-1)
+        pre = self.linear(x)
+        pre_b = self.bound * torch.tanh(pre / self.bound) #limit sine input from oscillating radically
+        return self.alpha * torch.sin(self.omega_0 * pre_b)
 
-class DensityContrastINR(nn.Module):
-    def __init__(self, nfreq=8, hidden=256, depth=5, rho_abs_max=600.0):
+class DensityContrastSIREN(nn.Module):
+    def __init__(self, hidden=256, rho_abs_max=600.0,
+                 omega_0_first=2.0, omega_0_hidden_list=None,
+                 alpha=1.0, bound=2.0):
         super().__init__()
-        self.pe = PositionalEncoding(num_freqs=nfreq, include_input=True)
-        in_dim = 3 * (1 + 2 * nfreq)
-        layers = []
-        h = hidden
-        layers += [nn.Linear(in_dim, h), nn.LeakyReLU(0.01)]
-        for _ in range(depth - 1):
-            layers += [nn.Linear(h, h), nn.LeakyReLU(0.01)]
-        layers += [nn.Linear(h, 1)]
-        self.net = nn.Sequential(*layers)
-        self.rho_abs_max = float(rho_abs_max)
+        self.rho_abs_max = rho_abs_max #maximum density contrast
+
+        #First siren = coords to features
+        self.first = SirenLayer( 
+            in_features=3, out_features=hidden,
+            omega_0=omega_0_first, is_first=True,
+            alpha=alpha, bound=bound
+        )
+
+        #Hidden siren
+        self.hidden = nn.Sequential(*[
+            SirenLayer(hidden, hidden, omega_0=omega, is_first=False,
+                              alpha=alpha, bound=bound)
+            for omega in omega_0_hidden_list
+        ])
+
+        #Two heads, mask predicts geometry, amp predicts contrast intensity with tanh
+        self.head_mask = nn.Linear(hidden, 1) #global trends
+        self.head_amp  = nn.Linear(hidden, 1) #anomaly intensity
+        with torch.no_grad():
+            b = math.sqrt(6.0 / hidden)
+            self.head_mask.weight.uniform_(-b * 1e-2, b * 1e-2); self.head_mask.bias.zero_()
+            self.head_amp.weight.uniform_(-b * 1e-2, b * 1e-2);  self.head_amp.bias.zero_()
 
     def forward(self, x):
-        z = self.pe(x)
-        out = self.net(z)
-        return self.rho_abs_max * torch.tanh(out)
+        h = self.first(x) #encode coords with siren
+        h = self.hidden(h)
 
-def train_inr(model, opt, coords_norm, G, gz_obs, Wd, Nx, Ny, Nz, dx, dy, dz, cfg):
+        mask = torch.sigmoid(self.head_mask(h))
+        amp  = torch.tanh(self.head_amp(h))
+        out = self.rho_abs_max * (amp * mask) #Output is a combination of two heads scaled to physical units
+
+        return out
+
+def train_inr(model, opt, coords_scaled, G, gz_obs, Wd, Nx, Ny, Nz, dx, dy, dz, cfg):
     history = {"total": [], "gravity": []}
     for ep in range(cfg['epochs']):
         opt.zero_grad()
-        m_pred = model(coords_norm).view(-1)
+        m_pred = model(coords_scaled).view(-1)
         gz_pred = torch.matmul(G, m_pred.unsqueeze(1)).squeeze(1)
         residual = gz_pred - gz_obs
         data_term = cfg['gamma'] * torch.mean((Wd * residual) ** 2)
+
         loss = data_term
         loss.backward()
         opt.step()
@@ -149,10 +187,11 @@ def run():
     X3, Y3, Z3 = np.meshgrid(Xc, Yc, Zc, indexing='ij')
     grid_coords = np.stack([X3.ravel(), Y3.ravel(), Z3.ravel()], axis=1)
 
-    c_mean = grid_coords.mean(axis=0, keepdims=True)
-    c_std = grid_coords.std(axis=0, keepdims=True)
-    coords_norm = (grid_coords - c_mean) / (c_std + 1e-12)
-    coords_norm = torch.tensor(coords_norm, dtype=torch.float32, device=device, requires_grad=True)
+    ###Normalize to -1, 1 to avoid issues with SIREN layers
+    mins = grid_coords.min(axis=0, keepdims=True)
+    maxs = grid_coords.max(axis=0, keepdims=True)
+    coords_scaled = 2.0 * (grid_coords - mins) / (maxs - mins + 1e-12) - 1.0
+    coords_scaled = torch.tensor(coords_scaled, dtype=torch.float32, device=device)
 
     dz_half = dz / 2.0
     cell_grid = np.hstack([grid_coords, np.full((grid_coords.shape[0], 1), dz_half)])
@@ -180,14 +219,21 @@ def run():
     gz_obs = gz_true + noise
     Wd = 1.0 / sigma
 
-    cfg = dict(gamma=1.0, epochs=300, lr=1e-2)
+    cfg = dict(gamma=1.0, epochs=300,lr=5e-4) #lr=1e-2 test SIREN with a lower lr
 
-    model = DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'])
-    hist = train_inr(model, opt, coords_norm, G, gz_obs, Wd, Nx, Ny, Nz, dx, dy, dz, cfg)
+    
+    model = DensityContrastSIREN(
+        hidden=256, rho_abs_max=600.0,
+        omega_0_first=2.0,
+        omega_0_hidden_list=[1.0, 0.7, 0.6],
+        alpha=1.0, bound=2.0
+    )
+
+    opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'], weight_decay=1e-6)
+    hist = train_inr(model, opt, coords_scaled, G, gz_obs, Wd, Nx, Ny, Nz, dx, dy, dz, cfg)
 
     with torch.no_grad():
-        m_inv = model(coords_norm).view(-1)
+        m_inv = model(coords_scaled).view(-1)
         gz_pred = (G @ m_inv.unsqueeze(1)).squeeze(1)
 
     def get_axes_coords():
