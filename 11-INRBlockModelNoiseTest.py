@@ -7,6 +7,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
+
+def obs_loader(G, rho_true_vec, nl, device, path="data/frozen_gz_obs.pt"):
+    #If data exists, load, else make folder
+    if os.path.exists(path):
+        blob = torch.load(path, map_location=device)
+        return blob["gz_obs"].to(device), torch.tensor(blob["sigma"], device=device)
+
+    #Create data
+    with torch.no_grad():
+        gz_true = (G @ rho_true_vec.unsqueeze(1)).squeeze(1)
+    sigma = nl * gz_true.std()
+
+    #Fixed seed for data
+    gen = torch.Generator(device=device).manual_seed(2525)
+    noise = sigma * torch.randn(gz_true.shape, device=device, generator=gen)
+    gz_obs = gz_true + noise
+
+    #Save noisy data
+    torch.save({
+        "gz_obs": gz_obs.cpu(),
+        "sigma": float(sigma.item()),
+    }, path)
+    return gz_obs, sigma
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -131,9 +155,136 @@ def get_block_boundaries(Nx, Ny, Nz):
             boundaries.append((xs, xe, ys, ye, z_idx))
     return boundaries
 
-def run():
-    set_seed(42)
+init_path = "data/init_weights.pt"
+if not os.path.exists(init_path):
+    os.makedirs("data", exist_ok=True)
+    model = DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0)
+    torch.save(model.state_dict(), init_path)
+
+def run_local_minima_test(n_runs=5):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    #Build model
+    dx = dy = dz = 50.0
+    x = np.arange(0, 1000 + dx, dx)
+    y = np.arange(0, 1000 + dy, dy)
+    z = np.arange(0, 500 + dz, dz)
+    Nx, Ny, Nz = len(x), len(y), len(z)
+
+    X3, Y3, Z3 = np.meshgrid(x, y, z, indexing='ij')
+    grid_coords = np.stack([X3.ravel(), Y3.ravel(), Z3.ravel()], axis=1)
+
+    c_mean = grid_coords.mean(axis=0, keepdims=True)
+    c_std  = grid_coords.std(axis=0, keepdims=True)
+    coords_norm = (grid_coords - c_mean) / (c_std + 1e-12)
+    coords_norm = torch.tensor(coords_norm, dtype=torch.float32, device=device, requires_grad=True)
+
+    dz_half = dz / 2.0
+    cell_grid = np.hstack([grid_coords, np.full((grid_coords.shape[0], 1), dz_half)])
+    cell_grid = torch.tensor(cell_grid, dtype=torch.float32, device=device)
+
+    XX, YY = np.meshgrid(x, y, indexing='ij')
+    obs = np.column_stack([XX.ravel(), YY.ravel(), -np.ones(XX.size)])
+    obs = torch.tensor(obs, dtype=torch.float32, device=device)
+
+    print("Building G ...")
+    G = construct_sensitivity_matrix_G_torch(cell_grid, obs, dx, dy, device)
+    G = G.clone().detach().requires_grad_(False)
+
+    rho_true_vec, _ = make_block_model(Nx, Ny, Nz, dx, dy, dz)
+    rho_true_vec = rho_true_vec.to(device)
+
+    #Frozen noise
+    nl = 0.01
+    gz_obs, sigma = obs_loader(G, rho_true_vec, nl, device)
+    Wd = 1.0 / sigma
+
+    cfg = dict(gamma=1.0, epochs=300, lr=1e-2)
+
+    all_hist = []
+    final_losses = []
+    end_state_dicts = []
+
+
+    #Several runs with varying seeds
+    for run_id in range(n_runs):
+        seed = 100 + run_id
+        print(f"\nRUN {run_id+1}/{n_runs}")
+        set_seed(seed)
+
+        #Only model initialization differs
+        model = DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'])
+
+        hist = train_inr(model, opt, coords_norm, G, gz_obs, Wd,
+                         Nx, Ny, Nz, dx, dy, dz, cfg)
+        all_hist.append(hist['gravity']) #Technically total loss since no additional terms are added
+        #For line search
+        final_losses.append(hist['gravity'][-1])
+        end_state_dicts.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+
+    plt.figure(figsize=(8, 5))
+    for i, h in enumerate(all_hist):
+        plt.plot(h, alpha=0.7, label=f'run {i+1}')
+    plt.yscale('log')
+    plt.xlabel("Epoch")
+    plt.ylabel("Gravity loss")
+    plt.grid(True, ls='--', alpha=0.3)
+    plt.title("Training with varying initializations (frozen noise)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("plots/local_min_test.png", dpi=300)
+    plt.close()
+
+    #---Line search for identifying local minima, as per Goodfellow (2014)
+    final_losses_np = np.array(final_losses)
+    idx_best = int(np.argmin(final_losses_np)) #Smallest loss
+    idx_worst = int(np.argmax(final_losses_np)) #Largest loss
+
+    sdA = end_state_dicts[idx_best]
+    sdB = end_state_dicts[idx_worst]
+
+    print(f"\nLine search between best model (loss={final_losses_np[idx_best]:.3e}) "f"and worst model (loss={final_losses_np[idx_worst]:.3e})")
+
+    #Dummy model for interpolating
+    dummy_model = DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0).to(device)
+    t_values = np.linspace(0.0, 1.0, 31) #Generate list of interpolation points, θ (theta) values
+    losses = []
+
+    for t in t_values: #For each t, create an interpolated model
+        t = float(t)
+        sd_interp = {k: (1.0 - t) * sdA[k] + t * sdB[k] for k in sdA.keys()}  #θ = (1−α)θ0 +αθ1 parameter space line
+        dummy_model.load_state_dict(sd_interp, strict=True) #Give model interpolated weights
+        #Calculate loss with model
+        with torch.no_grad():
+            m_pred = dummy_model(coords_norm).view(-1)
+            gz_pred = (G @ m_pred.unsqueeze(1)).squeeze(1)
+            residual = gz_pred - gz_obs
+            L = torch.mean((Wd * residual) ** 2).item()
+
+        losses.append(L) #vector of interpolated losses
+
+    #Plot line search
+    plt.figure(figsize=(6, 4))
+    plt.plot(t_values, losses, marker='o')
+    plt.xlabel("Model configuration from A to B")
+    plt.ylabel("Gravity loss")
+    plt.title("Parameter space line search")
+    plt.grid(True, ls='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("plots/linesearch.png", dpi=300)
+    plt.close()
+
+def run():
+    set_seed(42) #Set seed here
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    #Always load the same model
+    #model = DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0).to(device)
+    #model.load_state_dict(torch.load(init_path, map_location=device))
+    #print("Init:", sum([p.sum().item() for p in model.parameters()]))
+    #
+
     os.makedirs('plots', exist_ok=True)
 
     dx = dy = 50.0
@@ -174,15 +325,24 @@ def run():
     with torch.no_grad():
         gz_true = (G @ rho_true_vec.unsqueeze(1)).squeeze(1)
 
+    #Frozen noise
     nl = 0.01
-    sigma = nl * gz_true.std()
-    noise = sigma * torch.randn_like(gz_true)
-    gz_obs = gz_true + noise
+    gz_obs, sigma = obs_loader(G, rho_true_vec, nl, device)
     Wd = 1.0 / sigma
+
+    #Unfrozen noise
+    #nl = 0.01
+    #sigma = nl * gz_true.std()
+    #noise = sigma * torch.randn_like(gz_true)
+    #gz_obs = gz_true + noise
+    #Wd = 1.0 / sigma
+    #
 
     cfg = dict(gamma=1.0, epochs=300, lr=1e-2)
 
+    #Unfrozen model
     model = DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0).to(device)
+    
     opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'])
     hist = train_inr(model, opt, coords_norm, G, gz_obs, Wd, Nx, Ny, Nz, dx, dy, dz, cfg)
 
@@ -288,6 +448,7 @@ def run():
 
     def to_mgal(g):
         return 1e5 * g.detach().cpu().numpy()
+    
     obs_mgal = to_mgal(gz_obs)
     pre_mgal = to_mgal(gz_pred)
     res_mgal = obs_mgal - pre_mgal
@@ -336,4 +497,5 @@ def run():
     print(f"RMS data misfit ≈ {rms_gz:.3f} mGal")
 
 if __name__ == '__main__':
-    run()
+    #run()
+    run_local_minima_test(n_runs=5)
