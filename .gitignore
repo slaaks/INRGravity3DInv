@@ -1,0 +1,7 @@
+# Plot outputs
+plots/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
