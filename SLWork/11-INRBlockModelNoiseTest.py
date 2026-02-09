@@ -116,6 +116,10 @@ class DensityContrastINR(nn.Module):
 
 def train_inr(model, opt, coords_norm, G, gz_obs, Wd, Nx, Ny, Nz, dx, dy, dz, cfg):
     history = {"total": [], "gravity": []}
+    
+    best_loss = float('inf')
+    best_state = None
+    
     for ep in range(cfg['epochs']):
         opt.zero_grad()
         m_pred = model(coords_norm).view(-1)
@@ -125,11 +129,16 @@ def train_inr(model, opt, coords_norm, G, gz_obs, Wd, Nx, Ny, Nz, dx, dy, dz, cf
         loss = data_term
         loss.backward()
         opt.step()
+        
+        if data_term.item() < best_loss: #Log best model
+            best_loss = data_term.item()
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
         history['gravity'].append(float(data_term.item()))
         history['total'].append(float(loss.item()))
         if ep % 50 == 0 or ep == cfg['epochs'] - 1:
             print(f"Epoch {ep:4d} | data {history['gravity'][-1]:.3e} | total {history['total'][-1]:.3e}")
-    return history
+    return history, best_state
 
 def make_block_model(Nx, Ny, Nz, dx, dy, dz, rho_bg=0.0, rho_blk=400.0):
     m = torch.full((Nx, Ny, Nz), rho_bg)
@@ -199,12 +208,11 @@ def run_local_minima_test(n_runs=5):
     gz_obs, sigma = obs_loader(G, rho_true_vec, nl, device)
     Wd = 1.0 / sigma
 
-    cfg = dict(gamma=1.0, epochs=300, lr=1e-2)
+    cfg = dict(gamma=1.0, epochs=500, lr=1e-2)
 
     all_hist = []
     final_losses = []
     end_state_dicts = []
-
 
     #Several runs with varying seeds
     for run_id in range(n_runs):
@@ -216,16 +224,29 @@ def run_local_minima_test(n_runs=5):
         model = DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0).to(device)
         opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'])
 
-        hist = train_inr(model, opt, coords_norm, G, gz_obs, Wd,
-                         Nx, Ny, Nz, dx, dy, dz, cfg)
+        hist, best_state = train_inr(model, opt, coords_norm, G, gz_obs, Wd,
+                             Nx, Ny, Nz, dx, dy, dz, cfg)
+
+        model.load_state_dict(best_state) #Best state of the model
+
+        #Prints
+        final_loss = hist['gravity'][-1]
+        min_loss   = min(hist['gravity'])
+        print(f"Min loss = {min_loss:.3e}, final epoch loss = {final_loss:.3e}")
+
         all_hist.append(hist['gravity']) #Technically total loss since no additional terms are added
         #For line search
-        final_losses.append(hist['gravity'][-1])
+        final_losses.append(min(hist['gravity'])) #Best model
         end_state_dicts.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
 
     plt.figure(figsize=(8, 5))
+
     for i, h in enumerate(all_hist):
-        plt.plot(h, alpha=0.7, label=f'run {i+1}')
+        plt.plot(h, alpha=0.8, label=f'run {i+1}')
+        h_np = np.asarray(h)
+        j_min = int(np.argmin(h_np)) #lowest loss epoch
+        v_min = float(h_np[j_min])#min loss value
+        plt.plot(j_min, v_min, 'o', color='red', markersize=5, zorder=5)
     plt.yscale('log')
     plt.xlabel("Epoch")
     plt.ylabel("Gravity loss")
@@ -338,13 +359,17 @@ def run():
     #Wd = 1.0 / sigma
     #
 
-    cfg = dict(gamma=1.0, epochs=300, lr=1e-2)
+    cfg = dict(gamma=1.0, epochs=500, lr=1e-2)
 
     #Unfrozen model
     model = DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0).to(device)
     
     opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'])
-    hist = train_inr(model, opt, coords_norm, G, gz_obs, Wd, Nx, Ny, Nz, dx, dy, dz, cfg)
+    
+    hist, best_state = train_inr(model, opt, coords_norm, G, gz_obs, Wd,
+                             Nx, Ny, Nz, dx, dy, dz, cfg)
+
+    model.load_state_dict(best_state)
 
     with torch.no_grad():
         m_inv = model(coords_norm).view(-1)
