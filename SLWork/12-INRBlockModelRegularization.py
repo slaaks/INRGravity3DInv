@@ -267,15 +267,15 @@ def run():
                               wx=1.0, wy=1.0, wz=1.0, tv_eps=1e-6),
 
         "tik0": dict(gamma=1.0, epochs=300, lr=1e-3,
-                     tik0=1e-10, tik1=0.0, tv=0.0,
+                     tik0=1e-13, tik1=0.0, tv=0.0,
                      wx=1.0, wy=1.0, wz=1.0, tv_eps=1e-6),
 
         "tik1": dict(gamma=1.0, epochs=300, lr=1e-2,
-                     tik0=0.0, tik1=1e-6, tv=0.0,
+                     tik0=0.0, tik1=1e-7, tv=0.0,
                      wx=1.0, wy=1.0, wz=1.0, tv_eps=1e-6),
 
         "tv":   dict(gamma=1.0, epochs=300, lr=1e-3,
-                     tik0=0.0, tik1=0.0, tv=5e-7,
+                     tik0=0.0, tik1=0.0, tv=1e-7,
                      wx=1.0, wy=1.0, wz=1.0, tv_eps=1e-6)
     }
 
@@ -299,11 +299,23 @@ def run():
             results[name] = model(coords_norm).view(Nx, Ny, Nz).detach().cpu().numpy()
 
     #Plot regularizers
+    x1d = grid_coords[:, 0].reshape(Nx, Ny, Nz)[:, 0, 0]
+    y1d = grid_coords[:, 1].reshape(Nx, Ny, Nz)[0, :, 0]
+    z1d = grid_coords[:, 2].reshape(Nx, Ny, Nz)[0, 0, :]
+
+    x_edge_min, x_edge_max = x1d[0] - dx/2, x1d[-1] + dx/2
+    y_edge_min, y_edge_max = y1d[0] - dy/2, y1d[-1] + dy/2
+    z_edge_min, z_edge_max = z1d[0] - dz/2, z1d[-1] + dz/2
+
+    extent_xy = [x_edge_min, x_edge_max, y_edge_min, y_edge_max]
+    extent_xz = [x_edge_min, x_edge_max, z_edge_max, z_edge_min]
+    extent_yz = [y_edge_min, y_edge_max, z_edge_max, z_edge_min]
+
     slice_z = min(Nz - 1, 5)
+    slice_y = Ny // 2
+    slice_x = Nx // 2
 
-    fig, axes = plt.subplots(1, 5, figsize=(28, 6))
     names = ["true", "unregularized", "tik0", "tik1", "tv"]
-
     models = [
         rho_true_3d.cpu().numpy(),
         results["unregularized"],
@@ -312,17 +324,58 @@ def run():
         results["tv"]
     ]
 
-    #vmin = min(m.min() for m in models)
-    #vmax = max(m.max() for m in models)
-    vmin, vmax = 0, 250.0
+    vmin, vmax = 0, 250
+    fig, axes = plt.subplots(3, 5, figsize=(28, 16))
 
-    for ax, name, m in zip(axes, names, models):
-        ax.imshow(m[:, :, slice_z].T, origin='lower',
-                  vmin=vmin, vmax=vmax, cmap='viridis')
-        ax.set_title(name)
+    #XY
+    for ax, name, m in zip(axes[0], names, models):
+        im = ax.imshow(
+            m[:, :, slice_z].T,
+            origin="lower",
+            extent=extent_xy,
+            aspect="auto",
+            cmap="viridis",
+            vmin=vmin, vmax=vmax
+        )
+        ax.set_title(f"{name} – XY @ z={z1d[slice_z]:.0f} m")
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
-        ax.set_aspect("equal")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    #XZ
+    for ax, name, m in zip(axes[1], names, models):
+        im = ax.imshow(
+            m[:, slice_y, :].T,
+            origin="upper",
+            extent=extent_xz,
+            aspect="auto",
+            cmap="viridis",
+            vmin=vmin, vmax=vmax
+        )
+        ax.set_title(f"{name} – XZ @ y={y1d[slice_y]:.0f} m")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("Depth (m)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    #YZ
+    for ax, name, m in zip(axes[2], names, models):
+        im = ax.imshow(
+            m[slice_x, :, :].T,
+            origin="upper",
+            extent=extent_yz,
+            aspect="auto",
+            cmap="viridis",
+            vmin=vmin, vmax=vmax
+        )
+        ax.set_title(f"{name} – YZ @ x={x1d[slice_x]:.0f} m")
+        ax.set_xlabel("y (m)")
+        ax.set_ylabel("Depth (m)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    #Distortion fix
+    for row in axes:
+        for ax in row:
+            ax.set_aspect(1.0)
 
     fig.tight_layout()
     fig.savefig("plots/RegularizerComparison.png", dpi=300)

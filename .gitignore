@@ -1,5 +1,7 @@
 # Plot outputs
 plots/
+#data
+data/
 
 # Python
 __pycache__/
