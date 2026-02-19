@@ -681,7 +681,6 @@ def run():
     inv_max = INV_VMAX
 
     fig1, axes = plt.subplots(3, 3, figsize=(16, 15))
-    # --- replace your extent setup with this ---
     # 1D arrays of cell centers
     x1d, y1d, z1d = get_axes_coords()
 

@@ -185,7 +185,7 @@ def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
                 f"Epoch {ep:4d} | data {history['gravity'][-1]:.3e} | "
                 f"tik0 {history['tik0'][-1]:.3e} | tik1 {history['tik1'][-1]:.3e} | tv {history['tv'][-1]:.3e} | "
                 f"total {history['total'][-1]:.3e}"
-            )
+            )  
     return history
 
 def make_block_model(Nx, Ny, Nz, dx, dy, dz, rho_bg=0.0, rho_blk=400.0):
