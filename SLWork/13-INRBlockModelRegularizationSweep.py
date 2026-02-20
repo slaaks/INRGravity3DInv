@@ -115,7 +115,6 @@ def compute_gradient(m, Nx, Ny, Nz, dx, dy, dz):
 
     return gx, gy, gz
 
-
 def tik0_loss(m, dx, dy, dz):
     cell_vol = dx * dy * dz
     return cell_vol * torch.mean(m**2)
@@ -133,7 +132,6 @@ def tv_loss(m, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0):
     tv_vals = torch.sqrt(gx**2 + gy**2 + gz**2 + eps)
     return cell_vol * torch.mean(tv_vals)
 
-#Norms
 def tik0_norm(m, dx, dy, dz):
     cell_vol = dx * dy * dz
     return torch.sqrt(cell_vol * torch.sum(m**2) + 1e-12)
@@ -144,7 +142,7 @@ def tik1_norm(m, Nx, Ny, Nz, dx, dy, dz, wx=1.0, wy=1.0, wz=1.0):
     gx, gy, gz = wx * gx, wy * gy, wz * gz
     return torch.sqrt(cell_vol * torch.sum(gx**2 + gy**2 + gz**2) + 1e-12)
 
-def tv_norm(m, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0):
+def tv_norm(m, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0): #Loss contains norm
     return tv_loss(m, Nx, Ny, Nz, dx, dy, dz, eps=eps, wx=wx, wy=wy, wz=wz)
 
 def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
@@ -155,9 +153,9 @@ def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
     gamma = float(cfg.get('gamma', 1.0))
 
     #Regularization weights
-    lam0   = float(cfg.get('tik0', 0.0))  #0th order
-    lam1   = float(cfg.get('tik1', 0.0))  #1st order
-    lam_tv = float(cfg.get('tv', 0.0))    #total variation
+    lam0 = float(cfg.get('tik0', 0.0)) #0th order
+    lam1 = float(cfg.get('tik1', 0.0)) #1st order
+    lam_tv = float(cfg.get('tv', 0.0)) #total variation
 
     #Directional anisotropy
     wx = float(cfg.get('wx', 1.0))
@@ -250,7 +248,7 @@ def run_single_inversion(model_ctor, coords_norm, G, d_obs, Wd,
         gamma=1.0,
         tik0 = lam if reg_type=="tik0" else 0.0,
         tik1 = lam if reg_type=="tik1" else 0.0,
-        tv   = lam if reg_type=="tv"   else 0.0,
+        tv = lam if reg_type=="tv" else 0.0,
         wx=1.0, wy=1.0, wz=1.0,
         tv_eps=1e-8
     )
@@ -277,7 +275,7 @@ def sweep_lambda(model_ctor, coords_norm, G, d_obs, Wd,
                  Nx, Ny, Nz, dx, dy, dz,
                  lambda_values, reg_type,
                  epochs=200, lr=1e-3,
-                 device=None, warm_start=True,
+                 device=None, warm_start=True, #Warm start reuses model parameters during sweep for a continuous curve
                  wx=1.0, wy=1.0, wz=1.0, tv_eps=1e-8):
 
     if device is None:
@@ -327,23 +325,56 @@ def sweep_lambda(model_ctor, coords_norm, G, d_obs, Wd,
     return np.array(lam_out), np.array(misfits), np.array(regs)
 
 
-def plot_lcurve(lams, misfits, regs, reg_type, title, filename):
+def plot_lcurve(lams, misfits, regs, title, filename):
+    best_lam, best_idx = find_best_lambda(misfits, regs, lams)
 
-    order = np.argsort(lams)
-    lams, misfits, regs = np.asarray(lams)[order], np.asarray(misfits)[order], np.asarray(regs)[order]
+    order = np.argsort(misfits)
+    misfits = np.asarray(misfits)[order]
+    regs = np.asarray(regs)[order]
+    lams = np.asarray(lams)[order]
+
+    bx, by = misfits[best_idx], regs[best_idx]
 
     plt.figure(figsize=(6,5))
     plt.loglog(misfits, regs, "-o", markersize=4)
+    plt.loglog([bx], [by], "ro", markersize=5,
+               label=f"Best λ = {best_lam:.2e}")
 
     plt.xlabel(r"Residual norm $\|g_{\mathrm{pred}} - g_{\mathrm{obs}}\|_2$")
     plt.ylabel(r"Solution norm $\|m\|_2$")
-
     plt.title(title)
     plt.grid(True, which="both", ls="--", alpha=0.5)
-
+    plt.legend()
     plt.tight_layout()
     plt.savefig(filename, dpi=300)
     plt.close()
+
+#Helper function to find the best lambda value
+def find_best_lambda(misfits, regs, lambdas):
+    x = np.log(np.asarray(misfits, dtype=float))
+    y = np.log(np.asarray(regs, dtype=float))
+    lam = np.asarray(lambdas, dtype=float)
+
+    #Sort by residual
+    order = np.argsort(x)
+    x, y, lam = x[order], y[order], lam[order]
+    #Define endpoints
+    x0, y0 = x[0],  y[0]
+    x1, y1 = x[-1], y[-1]
+
+    #Line coefficient ax + by + c = 0
+    A = y0 - y1
+    B = x1 - x0
+    C = x0*y1 - x1*y0
+    denom = np.hypot(A, B) + 1e-30
+
+    #Perpendicular distance of each point
+    d = np.abs(A*x + B*y + C) / denom
+    #Exclude endpoints
+    d[0] = d[-1] = 0.0
+    #Find index of best lambda
+    idx = int(np.argmax(d))
+    return float(lam[idx]), idx
 
 def run():
     set_seed(42)
@@ -406,7 +437,7 @@ def run():
         epochs=200, lr=1e-3,
         device=device, warm_start=True
     )
-    plot_lcurve(lam_t0, mis_t0, reg_t0, reg_type="tik0",
+    plot_lcurve(lam_t0, mis_t0, reg_t0,
                 title="Tik0 L-curve", filename="plots/T0_curve.png")
 
     print("\n--- Sweep Tik1 ---")
@@ -418,19 +449,19 @@ def run():
         epochs=200, lr=1e-3,
         device=device, warm_start=True
     )
-    plot_lcurve(lam_t1, mis_t1, reg_t1, reg_type="tik1",
+    plot_lcurve(lam_t1, mis_t1, reg_t1,
                 title="Tik1 L-curve", filename="plots/T1_curve.png")
 
     print("\n-- Sweep TV ---")
     lam_tv, mis_tv, reg_tv = sweep_lambda(
         model_ctor, coords_norm, G, d_obs, Wd,
         Nx, Ny, Nz, dx, dy, dz,
-        lambda_values=lams_tv,
+        lambda_values=lams_tv, 
         reg_type="tv",
         epochs=200, lr=1e-4,
         device=device, warm_start=True
     )
-    plot_lcurve(lam_tv, mis_tv, reg_tv, reg_type="tv",
+    plot_lcurve(lam_tv, mis_tv, reg_tv,
                 title="TV L-curve", filename="plots/TV_curve.png")
 
 if __name__ == '__main__':

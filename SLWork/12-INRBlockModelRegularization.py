@@ -91,28 +91,47 @@ class DensityContrastINR(nn.Module):
         return self.rho_abs_max * torch.tanh(out)
     
 #Gradient helper function for regularizers
-def compute_gradient(m_pred, Nx, Ny, Nz, dx, dy, dz):
-    m3 = m_pred.view(Nx, Ny, Nz)
+def compute_gradient(m, Nx, Ny, Nz, dx, dy, dz):
+    m3 = m.reshape(Nx, Ny, Nz)
 
     gx = torch.empty_like(m3)
     gy = torch.empty_like(m3)
     gz = torch.empty_like(m3)
 
-    #Central difference for regularizer functions
+    #Central differences (interior)
     gx[1:-1, :, :] = (m3[2:, :, :] - m3[:-2, :, :]) / (2.0 * dx)
-    gx[0,     :, :] = (m3[1, :, :] - m3[0, :, :]) / dx #forward at left boundary to avoid out of bounds errors
-    gx[-1,    :, :] = (m3[-1, :, :] - m3[-2, :, :]) / dx #backward at right boundary
-
     gy[:, 1:-1, :] = (m3[:, 2:, :] - m3[:, :-2, :]) / (2.0 * dy)
-    gy[:, 0,    :] = (m3[:, 1, :] - m3[:, 0, :]) / dy
-    gy[:, -1,   :] = (m3[:, -1, :] - m3[:, -2, :]) / dy
-
     gz[:, :, 1:-1] = (m3[:, :, 2:] - m3[:, :, :-2]) / (2.0 * dz)
-    gz[:, :, 0    ] = (m3[:, :, 1] - m3[:, :, 0]) / dz
-    gz[:, :, -1   ] = (m3[:, :, -1] - m3[:, :, -2]) / dz
+
+    #One-sided boundaries
+    gx[0, :, :]  = (m3[1, :, :] - m3[0, :, :]) / dx
+    gx[-1, :, :] = (m3[-1, :, :] - m3[-2, :, :]) / dx
+
+    gy[:, 0, :]  = (m3[:, 1, :] - m3[:, 0, :]) / dy
+    gy[:, -1, :] = (m3[:, -1, :] - m3[:, -2, :]) / dy
+
+    gz[:, :, 0]  = (m3[:, :, 1] - m3[:, :, 0]) / dz
+    gz[:, :, -1] = (m3[:, :, -1] - m3[:, :, -2]) / dz
 
     return gx, gy, gz
 
+def tik0_loss(m, dx, dy, dz):
+    cell_vol = dx * dy * dz
+    return cell_vol * torch.mean(m**2)
+
+def tik1_loss(m, Nx, Ny, Nz, dx, dy, dz, wx=1.0, wy=1.0, wz=1.0):
+    cell_vol = dx * dy * dz
+    gx, gy, gz = compute_gradient(m, Nx, Ny, Nz, dx, dy, dz)
+    gx, gy, gz = wx * gx, wy * gy, wz * gz
+    return cell_vol * torch.mean(gx**2 + gy**2 + gz**2)
+
+def tv_loss(m, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0):
+    cell_vol = dx * dy * dz
+    gx, gy, gz = compute_gradient(m, Nx, Ny, Nz, dx, dy, dz)
+    gx, gy, gz = wx * gx, wy * gy, wz * gz
+    tv_vals = torch.sqrt(gx**2 + gy**2 + gz**2 + eps)
+    return cell_vol * torch.mean(tv_vals)
+'''
 #1st order Tikhonov
 def first_order_tikhonov(m_pred, Nx, Ny, Nz, dx, dy, dz, wx=1.0, wy=1.0, wz=1.0):
     voxel = dx * dy * dz
@@ -127,6 +146,7 @@ def total_variation(m_pred, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz
     gx, gy, gz = wx*gx, wy*gy, wz*gz
     tv = torch.sqrt(gx**2 + gy**2 + gz**2 + eps)
     return voxel * torch.sum(tv)
+'''
 
 def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
               Nx, Ny, Nz, dx, dy, dz, cfg):
@@ -158,18 +178,18 @@ def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
         residual = gz_pred - gz_obs
         data_term = gamma * torch.mean((Wd * residual) ** 2)
 
-        #Regularization terms
-        voxel = dx * dy * dz #Independent regardless of resolution
-        reg0 = lam0 * voxel * torch.sum(m_pred**2)
-        reg1 = lam1 * first_order_tikhonov(
-            m_pred, Nx, Ny, Nz, dx, dy, dz, wx=wx, wy=wy, wz=wz
+        #Regularization
+        reg0 = lam0 * tik0_loss(m_pred, dx, dy, dz)
+        reg1 = lam1 * tik1_loss(
+            m_pred, Nx, Ny, Nz, dx, dy, dz,
+            wx=wx, wy=wy, wz=wz
         )
-        reg_tv = lam_tv * total_variation(
-            m_pred, Nx, Ny, Nz, dx, dy, dz, eps=tv_eps, wx=wx, wy=wy, wz=wz
+        reg_tv = lam_tv * tv_loss(
+            m_pred, Nx, Ny, Nz, dx, dy, dz,
+            eps=tv_eps, wx=wx, wy=wy, wz=wz
         )
-
-        #Combined loss
         loss = data_term + reg0 + reg1 + reg_tv
+
         loss.backward()
         opt.step()
 
