@@ -90,7 +90,7 @@ class DensityContrastINR(nn.Module):
         out = self.net(z)
         return self.rho_abs_max * torch.tanh(out)
     
-#Gradient helper function for regularizers
+#---- Finite-difference gradient computatation for the regularizers ---
 def compute_gradient(m, Nx, Ny, Nz, dx, dy, dz):
     m3 = m.reshape(Nx, Ny, Nz)
 
@@ -115,38 +115,24 @@ def compute_gradient(m, Nx, Ny, Nz, dx, dy, dz):
 
     return gx, gy, gz
 
+#--- Regularizer functions ---
+#0th order Tikhonov
 def tik0_loss(m, dx, dy, dz):
     cell_vol = dx * dy * dz
     return cell_vol * torch.mean(m**2)
-
+#1st order Tikhonov
 def tik1_loss(m, Nx, Ny, Nz, dx, dy, dz, wx=1.0, wy=1.0, wz=1.0):
     cell_vol = dx * dy * dz
     gx, gy, gz = compute_gradient(m, Nx, Ny, Nz, dx, dy, dz)
     gx, gy, gz = wx * gx, wy * gy, wz * gz
     return cell_vol * torch.mean(gx**2 + gy**2 + gz**2)
-
+#Total variation (TV)
 def tv_loss(m, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0):
     cell_vol = dx * dy * dz
     gx, gy, gz = compute_gradient(m, Nx, Ny, Nz, dx, dy, dz)
     gx, gy, gz = wx * gx, wy * gy, wz * gz
     tv_vals = torch.sqrt(gx**2 + gy**2 + gz**2 + eps)
     return cell_vol * torch.mean(tv_vals)
-'''
-#1st order Tikhonov
-def first_order_tikhonov(m_pred, Nx, Ny, Nz, dx, dy, dz, wx=1.0, wy=1.0, wz=1.0):
-    voxel = dx * dy * dz
-    gx, gy, gz = compute_gradient(m_pred, Nx, Ny, Nz, dx, dy, dz)
-    gx, gy, gz = wx*gx, wy*gy, wz*gz #Optional directional anisotropy
-    return voxel * torch.sum(gx**2 + gy**2 + gz**2)
-
-#Total variation (TV)
-def total_variation(m_pred, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0):
-    voxel = dx * dy * dz
-    gx, gy, gz = compute_gradient(m_pred, Nx, Ny, Nz, dx, dy, dz)
-    gx, gy, gz = wx*gx, wy*gy, wz*gz
-    tv = torch.sqrt(gx**2 + gy**2 + gz**2 + eps)
-    return voxel * torch.sum(tv)
-'''
 
 def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
               Nx, Ny, Nz, dx, dy, dz, cfg):
@@ -156,15 +142,15 @@ def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
     gamma = float(cfg.get('gamma', 1.0))
 
     #Regularization weights
-    lam0  = float(cfg.get('tik0', 0.0)) #zero order
-    lam1  = float(cfg.get('tik1', 0.0)) #first order
-    lam_tv = float(cfg.get('tv', 0.0)) #total variation
+    lam0  = float(cfg.get('tik0', 0.0)) #0th order
+    lam1  = float(cfg.get('tik1', 0.0)) #1st order
+    lam_tv = float(cfg.get('tv', 0.0)) #Total variation
 
-    #Directional anisotrophy smoothing strength
+    #Directional anisotrophy
     wx = float(cfg.get('wx', 1.0))
     wy = float(cfg.get('wy', 1.0))
-    wz = float(cfg.get('wz', 1.0)) #Optionally edit vertical smoothing
-    #TV smoothing to ensure stability
+    wz = float(cfg.get('wz', 1.0))
+    #TV epsilon for stability
     tv_eps = float(cfg.get('tv_eps', 1e-6))
 
     device = next(model.parameters()).device
@@ -280,7 +266,7 @@ def run():
     noise = sigma * torch.randn_like(gz_true)
     gz_obs = gz_true + noise
     Wd = 1.0 / sigma
-
+    #Regularizer configuration
     configs = {
         "unregularized": dict(gamma=1.0, epochs=300, lr=1e-2,
                               tik0=0.0, tik1=0.0, tv=0.0,
@@ -291,7 +277,7 @@ def run():
                      wx=1.0, wy=1.0, wz=1.0, tv_eps=1e-6),
 
         "tik1": dict(gamma=1.0, epochs=300, lr=1e-2,
-                     tik0=0.0, tik1=1e-7, tv=0.0,
+                     tik0=0.0, tik1=8e-08, tv=0.0,
                      wx=1.0, wy=1.0, wz=1.0, tv_eps=1e-6),
 
         "tv":   dict(gamma=1.0, epochs=300, lr=1e-3,

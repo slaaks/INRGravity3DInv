@@ -90,7 +90,7 @@ class DensityContrastINR(nn.Module):
         out = self.net(z)
         return self.rho_abs_max * torch.tanh(out)
     
-#Gradient helper function for regularizers
+#---- Finite-difference gradient computatation for the regularizers ---
 def compute_gradient(m, Nx, Ny, Nz, dx, dy, dz):
     m3 = m.reshape(Nx, Ny, Nz)
 
@@ -115,16 +115,18 @@ def compute_gradient(m, Nx, Ny, Nz, dx, dy, dz):
 
     return gx, gy, gz
 
+#--- Regularizer functions ---
+#0th order Tikhonov
 def tik0_loss(m, dx, dy, dz):
     cell_vol = dx * dy * dz
     return cell_vol * torch.mean(m**2)
-
+#1st order Tikhonov
 def tik1_loss(m, Nx, Ny, Nz, dx, dy, dz, wx=1.0, wy=1.0, wz=1.0):
     cell_vol = dx * dy * dz
     gx, gy, gz = compute_gradient(m, Nx, Ny, Nz, dx, dy, dz)
     gx, gy, gz = wx * gx, wy * gy, wz * gz
     return cell_vol * torch.mean(gx**2 + gy**2 + gz**2)
-
+#Total variation (TV)
 def tv_loss(m, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0):
     cell_vol = dx * dy * dz
     gx, gy, gz = compute_gradient(m, Nx, Ny, Nz, dx, dy, dz)
@@ -132,6 +134,7 @@ def tv_loss(m, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0):
     tv_vals = torch.sqrt(gx**2 + gy**2 + gz**2 + eps)
     return cell_vol * torch.mean(tv_vals)
 
+#--- Regularizer norms for the L-curve calculation ---
 def tik0_norm(m, dx, dy, dz):
     cell_vol = dx * dy * dz
     return torch.sqrt(cell_vol * torch.sum(m**2) + 1e-12)
@@ -142,7 +145,7 @@ def tik1_norm(m, Nx, Ny, Nz, dx, dy, dz, wx=1.0, wy=1.0, wz=1.0):
     gx, gy, gz = wx * gx, wy * gy, wz * gz
     return torch.sqrt(cell_vol * torch.sum(gx**2 + gy**2 + gz**2) + 1e-12)
 
-def tv_norm(m, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0): #Loss contains norm
+def tv_norm(m, Nx, Ny, Nz, dx, dy, dz, eps=1e-6, wx=1.0, wy=1.0, wz=1.0):
     return tv_loss(m, Nx, Ny, Nz, dx, dy, dz, eps=eps, wx=wx, wy=wy, wz=wz)
 
 def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
@@ -155,13 +158,13 @@ def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
     #Regularization weights
     lam0 = float(cfg.get('tik0', 0.0)) #0th order
     lam1 = float(cfg.get('tik1', 0.0)) #1st order
-    lam_tv = float(cfg.get('tv', 0.0)) #total variation
+    lam_tv = float(cfg.get('tv', 0.0)) #Total variation
 
     #Directional anisotropy
     wx = float(cfg.get('wx', 1.0))
     wy = float(cfg.get('wy', 1.0))
     wz = float(cfg.get('wz', 1.0))
-    #TV eps for stability
+    #TV epsilon for stability
     tv_eps = float(cfg.get('tv_eps', 1e-8))
 
     model.train()
@@ -171,7 +174,7 @@ def train_inr(model, opt, coords_norm, G, gz_obs, Wd,
 
         m_pred = model(coords_norm).view(-1)
 
-        #Data term
+        #Data residual term
         gz_pred = (G @ m_pred.unsqueeze(1)).squeeze(1)
         residual = gz_pred - gz_obs
         data_term = gamma * torch.mean((Wd * residual) ** 2)
@@ -226,11 +229,13 @@ def get_block_boundaries(Nx, Ny, Nz):
             boundaries.append((xs, xe, ys, ye, z_idx))
     return boundaries
 
-###
+#--- Misfit norm for the L-curve calculation ---
 @torch.no_grad()
 def misfit_norm(G, m, d_obs, Wd):
     r = (G @ m) - d_obs
     return torch.linalg.norm(Wd * r).item()
+
+#--- Run a single inversion for a given lambda for the L-curve calculation ---
 def run_single_inversion(model_ctor, coords_norm, G, d_obs, Wd,
                          Nx, Ny, Nz, dx, dy, dz,
                          lam, reg_type, epochs=300, lr=1e-3, device=None):
@@ -270,12 +275,12 @@ def run_single_inversion(model_ctor, coords_norm, G, d_obs, Wd,
 
     return mis, reg, model
 
-#Helper function for lambda parameter sweep
+#--- Lambda sweep for the L-curve calculation ---
 def sweep_lambda(model_ctor, coords_norm, G, d_obs, Wd,
                  Nx, Ny, Nz, dx, dy, dz,
                  lambda_values, reg_type,
                  epochs=200, lr=1e-3,
-                 device=None, warm_start=True, #Warm start reuses model parameters during sweep for a continuous curve
+                 device=None, warm_start=True, #Warm start reuses model parameters during the sweep for a continuous L-curve
                  wx=1.0, wy=1.0, wz=1.0, tv_eps=1e-8):
 
     if device is None:
@@ -284,7 +289,7 @@ def sweep_lambda(model_ctor, coords_norm, G, d_obs, Wd,
     misfits, regs, lam_out = [], [], []
     model_prev = None
 
-    #Sweep from large to small
+    #Sweep from large to small values
     for lam in sorted(lambda_values, reverse=True):
         model = model_prev if (warm_start and model_prev is not None) else model_ctor().to(device)
         opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -324,7 +329,7 @@ def sweep_lambda(model_ctor, coords_norm, G, d_obs, Wd,
 
     return np.array(lam_out), np.array(misfits), np.array(regs)
 
-
+#--- Plot L-curve ---
 def plot_lcurve(lams, misfits, regs, title, filename):
     best_lam, best_idx = find_best_lambda(misfits, regs, lams)
 
@@ -349,7 +354,7 @@ def plot_lcurve(lams, misfits, regs, title, filename):
     plt.savefig(filename, dpi=300)
     plt.close()
 
-#Helper function to find the best lambda value
+#--- Find the optimal lambda value ---
 def find_best_lambda(misfits, regs, lambdas):
     x = np.log(np.asarray(misfits, dtype=float))
     y = np.log(np.asarray(regs, dtype=float))
@@ -362,17 +367,17 @@ def find_best_lambda(misfits, regs, lambdas):
     x0, y0 = x[0],  y[0]
     x1, y1 = x[-1], y[-1]
 
-    #Line coefficient ax + by + c = 0
+    #Line ax + by + c = 0 through endpoints
     A = y0 - y1
     B = x1 - x0
     C = x0*y1 - x1*y0
     denom = np.hypot(A, B) + 1e-30
 
-    #Perpendicular distance of each point
+    #Perpendicular distance of each point, deviation of curvature from the line
     d = np.abs(A*x + B*y + C) / denom
     #Exclude endpoints
     d[0] = d[-1] = 0.0
-    #Find index of best lambda
+    #Best lambda: maximum deviation from the line
     idx = int(np.argmax(d))
     return float(lam[idx]), idx
 
@@ -420,14 +425,14 @@ def run():
     d_obs = gz_true + noise
     Wd = 1.0 / (sigma + 1e-12)
 
-    def model_ctor(): #untrained INR model constructor
+    def model_ctor(): #Untrained INR model constructor
         return DensityContrastINR(nfreq=2, hidden=256, depth=4, rho_abs_max=600.0).to(device)
 
-    lams_t0 = np.logspace(-7, -4, 10)  #Lambda ranges
+    lams_t0 = np.logspace(-7, -4, 10) #Lambda ranges
     lams_t1 = np.logspace(-10, -6, 12)
     lams_tv = np.logspace(-5, -2, 12) 
 
-    #Sweeps for different regularizers
+    #Regularizer sweeps
     print("\n--- Sweep Tik0 ---")
     lam_t0, mis_t0, reg_t0 = sweep_lambda(
         model_ctor, coords_norm, G, d_obs, Wd,
