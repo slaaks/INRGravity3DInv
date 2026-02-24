@@ -39,25 +39,14 @@ RHO_ABS_MAX  = 600.0 # tanh output scaling (kg/m³)
 
 # --- Encoding strategy -------------------------------------------------
 #   'positional'  – sinusoidal Fourier features  (NeRF)
-#   'gaussian'    – random Fourier features      (Tancik et al., 2020)
 #   'hash'        – multi-resolution hash tables  (Instant-NGP)
-#   'triplane'    – three learnable 2-D feature planes
-#   'combined'    – concatenation of multiple encodings
-ENCODING_TYPE = 'hash'  # 'positional (2)', 'gaussian', 'hash', 'triplane', 'combined'
+ENCODING_TYPE = 'hash'  # 'positional', 'hash'
 
 ENCODING_CONFIGS = {
     'positional': dict(num_freqs=2),
-    'gaussian':   dict(num_freqs=64, sigma=4.0, include_input=True),
     'hash':       dict(n_levels=2, n_features_per_level=2,
                        log2_hashmap_size=17, base_resolution=4,
-                       finest_resolution=128),
-    'triplane':   dict(resolution=128, n_features=8),
-    'combined':   dict(
-        sub_encodings=['positional', 'triplane'],
-        sub_kwargs=[dict(num_freqs=2),
-                    dict(n_levels=8, n_features_per_level=2,
-                         log2_hashmap_size=17, base_resolution=4,
-                         finest_resolution=128)]),
+                       finest_resolution=128)
 }
 
 # --- Plotting -----------------------------------------------------------
@@ -110,61 +99,6 @@ class PositionalEncoding(nn.Module):
         parts = [x] if self.include_input else []
         for f in self.freqs:
             parts += [torch.sin(f * x), torch.cos(f * x)]
-        return torch.cat(parts, dim=-1)
-
-
-class GaussianFourierEncoding(nn.Module):
-    """Random Fourier Features (Tancik et al., 2020).
-
-    Intuition
-    ---------
-    Instead of hand-picking frequencies on a power-of-2 ladder (as in
-    positional encoding), this method draws a *random* matrix B from a
-    Gaussian distribution N(0, σ²) and projects each input through it:
-
-        γ(x) = [sin(2πBᵀx), cos(2πBᵀx)]
-
-    Imagine throwing darts randomly across the frequency spectrum — you
-    get a much more *uniform* coverage of spatial frequencies.  The key
-    hyperparameter is σ (the standard deviation of B):
-      • Small σ  → mostly low-frequency features → smooth reconstructions
-      • Large σ  → high frequencies included → sharper edges but risk of
-        over-fitting noise
-
-    Because B is fixed at initialisation (not learned), the encoding is
-    cheap and stable, but you must tune σ to match the expected spatial
-    scale of features in your model.
-
-    Trade-offs
-    ----------
-    • Broader, more uniform frequency coverage than positional encoding.
-    • σ acts as a single dial controlling the resolution–smoothness
-      trade-off; no need to choose individual frequency bands.
-    • Still a fixed (non-adaptive) encoding — it cannot dynamically
-      allocate more detail where the model is complex.
-    • Excellent for geophysical inversions where the target property
-      varies smoothly with occasional moderate contrasts.
-
-    Args:
-        input_dim:      Spatial dimensionality (default 3).
-        num_freqs:      Number of random frequency components.
-        sigma:          Std-dev of the Gaussian that generates B.
-                        Controls the typical spatial wavelength:
-                        larger σ → finer detail.
-        include_input:  Whether to prepend the raw coordinates.
-    """
-    def __init__(self, input_dim=3, num_freqs=128, sigma=10.0, include_input=True):
-        super().__init__()
-        self.include_input = include_input
-        B = torch.randn(input_dim, num_freqs) * sigma
-        self.register_buffer('B', B)
-        self.out_dim = 2 * num_freqs + (input_dim if include_input else 0)
-
-    def forward(self, x):
-        proj = x @ self.B
-        parts = [x] if self.include_input else []
-        parts += [torch.sin(2 * np.pi * proj),
-                  torch.cos(2 * np.pi * proj)]
         return torch.cat(parts, dim=-1)
 
 
@@ -294,135 +228,7 @@ class HashEncoding(nn.Module):
             outputs.append((weights * features).sum(dim=1))  # (N, F)
 
         return torch.cat(outputs, dim=-1)              # (N, n_levels*F)
-
-
-class TriplaneEncoding(nn.Module):
-    """Tri-plane encoding for 3D coordinates.
-
-    Intuition
-    ---------
-    Instead of storing features in a full 3-D voxel grid (memory O(R³)),
-    this encoding *factorises* the volume into three orthogonal 2-D
-    learnable feature images — one per axis-aligned plane:
-
-        plane_xy :  sees (x, y), ignores z
-        plane_xz :  sees (x, z), ignores y
-        plane_yz :  sees (y, z), ignores x
-
-    For a query point (x, y, z) the encoding:
-      1. Projects onto each plane (drops one coordinate).
-      2. Bilinearly interpolates F features from the 2-D grid.
-      3. Concatenates all three → output dim = 3 × F.
-
-    Think of it like taking three "X-ray" views of the volume from the
-    front, side, and top.  Each view captures 2-D spatial structure at
-    the grid resolution.  The MLP that follows must combine these three
-    partial views into a coherent 3-D prediction.
-
-    Memory scales as 3 × F × R² rather than F × R³, making it far more
-    efficient for high-resolution grids.  For R = 64, F = 16 this is
-    ~49 k parameters vs ~4 M for a full voxel grid.
-
-    Trade-offs
-    ----------
-    • Very memory-efficient for high-resolution spatial features.
-    • Features are **axis-aligned**: each plane only encodes 2 of 3
-      axes, so diagonal or spherical structures require the MLP to
-      combine the three views — this can produce staircase artifacts
-      aligned with the grid axes.
-    • Bilinear interpolation within each plane smooths features
-      between grid nodes, which can blur sharp density contrasts
-      and underestimate amplitudes.
-    • The resolution R controls the finest recoverable feature size:
-      effective spatial sampling ≈ domain_extent / R.
-    • Well-suited when the target model has dominant axis-aligned
-      structure (e.g. layered geology, block models).
-
-    Potential improvements
-    ----------------------
-    • Increase resolution to resolve finer boundaries.
-    • Use **product** instead of concatenation (f_xy ⊙ f_xz ⊙ f_yz)
-      to create true 3-D correlations and reduce axis-aligned bias.
-    • Pair with positional encoding ('combined') for off-axis detail.
-
-    Args:
-        resolution:  Spatial resolution of each 2-D feature plane (R).
-        n_features:  Number of feature channels per plane (F).
-        input_dim:   Spatial dimensionality (default 3).
-    """
-    def __init__(self, resolution=64, n_features=16, input_dim=3):
-        super().__init__()
-        self.resolution = resolution
-        self.n_features = n_features
-        self.out_dim = 3 * n_features
-        self.plane_xy = nn.Parameter(
-            torch.randn(1, n_features, resolution, resolution) * 0.01)
-        self.plane_xz = nn.Parameter(
-            torch.randn(1, n_features, resolution, resolution) * 0.01)
-        self.plane_yz = nn.Parameter(
-            torch.randn(1, n_features, resolution, resolution) * 0.01)
-
-    def forward(self, x):
-        # Normalise each axis to [-1, 1] for grid_sample
-        x_n = x.clone()
-        for d in range(3):
-            mn, mx = x[:, d].min(), x[:, d].max()
-            x_n[:, d] = 2 * (x[:, d] - mn) / (mx - mn + 1e-8) - 1
-        N = x.shape[0]
-        xy = x_n[:, :2].view(1, N, 1, 2)
-        xz = x_n[:, [0, 2]].view(1, N, 1, 2)
-        yz = x_n[:, [1, 2]].view(1, N, 1, 2)
-        f_xy = F.grid_sample(self.plane_xy, xy, align_corners=True,
-                             mode='bilinear', padding_mode='border')
-        f_xz = F.grid_sample(self.plane_xz, xz, align_corners=True,
-                             mode='bilinear', padding_mode='border')
-        f_yz = F.grid_sample(self.plane_yz, yz, align_corners=True,
-                             mode='bilinear', padding_mode='border')
-        f_xy = f_xy.squeeze(0).squeeze(-1).permute(1, 0)
-        f_xz = f_xz.squeeze(0).squeeze(-1).permute(1, 0)
-        f_yz = f_yz.squeeze(0).squeeze(-1).permute(1, 0)
-        return torch.cat([f_xy, f_xz, f_yz], dim=-1)
-
-
-class CombinedEncoding(nn.Module):
-    """Concatenates outputs from several encoding strategies.
-
-    Intuition
-    ---------
-    Each encoding has different strengths:
-      • Positional / Gaussian — lightweight, fixed features that provide
-        a reliable low-to-mid frequency baseline with no extra learnable
-        parameters.
-      • Hash — learnable, adaptive, multi-scale features that excel at
-        sharp boundaries but add parameters and may overfit.
-      • Triplane — memory-efficient learnable features, strong for
-        axis-aligned structure but weaker for diagonal features.
-
-    CombinedEncoding simply concatenates the outputs of two or more
-    encodings, letting the MLP draw on the best qualities of each.
-    For example, positional + hash gives stable low-frequency recovery
-    from the positional branch and sharp-edge fidelity from the hash
-    branch — the network learns which features to weight for each
-    spatial location.
-
-    Trade-offs
-    ----------
-    • Increases the input dimension to the MLP (sum of all sub-dim),
-      which may require a wider first hidden layer.
-    • More hyperparameters to tune (one set per sub-encoding).
-    • Redundant frequency coverage is generally harmless — the MLP
-      ignores features it does not need.
-    • Particularly useful in geophysical inversion where smooth
-      background + localised anomalies coexist.
-    """
-    def __init__(self, encodings):
-        super().__init__()
-        self.encodings = nn.ModuleList(encodings)
-        self.out_dim = sum(e.out_dim for e in encodings)
-
-    def forward(self, x):
-        return torch.cat([enc(x) for enc in self.encodings], dim=-1)
-
+    
 
 def create_encoding(encoding_type, **kwargs):
     """Factory: build an encoding module by name.
@@ -434,36 +240,17 @@ def create_encoding(encoding_type, **kwargs):
                   Simple, no learnable params; good general-purpose
                   baseline.  Tune `num_freqs` for resolution.
 
-    gaussian    – Random Fourier Features (Tancik et al., 2020).  A
-                  random projection matrix provides broad, uniform
-                  frequency coverage.  Tune `sigma` to match the
-                  spatial scale of target features.
-
     hash        – Multi-resolution hash tables (Müller et al., 2022 /
                   Instant-NGP).  Learnable feature grids at multiple
                   resolutions compressed via spatial hashing.  Most
                   flexible; best for sharp boundaries.  More params &
                   hyperparameters.
-
-    triplane    – Three learnable 2-D feature planes (EG3D-style).
-                  Memory-efficient O(R²) factorisation of 3-D space.
-                  Strong for axis-aligned structure; may show staircase
-                  artifacts for off-axis features.  Tune `resolution`.
-
-    combined    – Concatenation of ≥2 encodings above.  Leverages
-                  complementary strengths (e.g. positional for smooth
-                  background + hash for sharp anomalies).
     """
     if encoding_type == 'positional':
         enc = PositionalEncoding(
             num_freqs=kwargs.get('num_freqs', 8),
             include_input=kwargs.get('include_input', True))
         return enc
-    elif encoding_type == 'gaussian':
-        return GaussianFourierEncoding(
-            input_dim=kwargs.get('input_dim', 3),
-            num_freqs=kwargs.get('num_freqs', 128),
-            sigma=kwargs.get('sigma', 10.0))
     elif encoding_type == 'hash':
         return HashEncoding(
             n_levels=kwargs.get('n_levels', 16),
@@ -471,15 +258,6 @@ def create_encoding(encoding_type, **kwargs):
             log2_hashmap_size=kwargs.get('log2_hashmap_size', 19),
             base_resolution=kwargs.get('base_resolution', 16),
             finest_resolution=kwargs.get('finest_resolution', 512))
-    elif encoding_type == 'triplane':
-        return TriplaneEncoding(
-            resolution=kwargs.get('resolution', 64),
-            n_features=kwargs.get('n_features', 16))
-    elif encoding_type == 'combined':
-        sub_types  = kwargs.get('sub_encodings', ['positional', 'hash'])
-        sub_kwargs = kwargs.get('sub_kwargs', [{}, {}])
-        subs = [create_encoding(t, **kw) for t, kw in zip(sub_types, sub_kwargs)]
-        return CombinedEncoding(subs)
     else:
         raise ValueError(f"Unknown encoding type: {encoding_type}")
 
