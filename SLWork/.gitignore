@@ -1,0 +1,15 @@
+# Plot outputs
+plots/
+<<<<<<< HEAD
+#data
+data/
+
+=======
+docs/
+>>>>>>> upstream/main
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.docx
+*.pdf 
