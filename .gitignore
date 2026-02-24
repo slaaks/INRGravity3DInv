@@ -1,7 +1,9 @@
 # Plot outputs
 plots/
-
+docs/
 # Python
 __pycache__/
 *.pyc
 *.pyo
+*.docx
+*.pdf 

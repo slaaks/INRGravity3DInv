@@ -19,7 +19,7 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
     print(f"Seed = {seed}")
 
-def A_integral_torch(x, y, z):
+def A_integral_torch(x, y, z): 
     eps = 1e-20
     r = torch.sqrt(x**2 + y**2 + z**2).clamp_min(eps)
     return -(x * torch.log(torch.abs(y + r) + eps) +

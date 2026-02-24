@@ -43,7 +43,7 @@ RHO_ABS_MAX  = 600.0 # tanh output scaling (kg/m³)
 #   'hash'        – multi-resolution hash tables  (Instant-NGP)
 #   'triplane'    – three learnable 2-D feature planes
 #   'combined'    – concatenation of multiple encodings
-ENCODING_TYPE = 'positional'  # 'positional (2)', 'gaussian', 'hash', 'triplane', 'combined'
+ENCODING_TYPE = 'hash'  # 'positional (2)', 'gaussian', 'hash', 'triplane', 'combined'
 
 ENCODING_CONFIGS = {
     'positional': dict(num_freqs=2),
